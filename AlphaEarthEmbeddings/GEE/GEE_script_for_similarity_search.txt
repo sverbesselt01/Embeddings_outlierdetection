@@ -1,0 +1,154 @@
+var roi = 
+    /* color: #d63000 */
+    /* shown: false */
+    /* displayProperties: [
+      {
+        "type": "rectangle"
+      }
+    ] */
+    ee.Geometry.Polygon(
+        [[[4.1172602698668115, 51.233845658972086],
+          [4.1172602698668115, 51.08398370204549],
+          [4.4605830237730615, 51.08398370204549],
+          [4.4605830237730615, 51.233845658972086]]], null, false);
+
+// =======================
+// Load dataset
+// =======================
+var dataset = ee.ImageCollection('GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL');
+
+// =======================
+// Define ROI polygon
+// =======================
+//var roi = ee.Geometry.Polygon({
+//  coords: [[
+//    [2.5160657250775564, 50.71034720707968],
+//    [5.954786428202556, 50.71034720707968],
+//    [5.954786428202556, 51.51384453137782],
+//    [2.5160657250775564, 51.51384453137782],
+//    [2.5160657250775564, 50.71034720707968]
+//  ]],
+//  geodesic: false
+//});
+
+// =======================
+// Load embedding image (2024–2025)
+// =======================
+var image = dataset
+  .filterDate('2024-01-01', '2025-01-01')
+  .filterBounds(roi)
+  .first();
+
+var embeddingVis = {
+  min: -0.3,
+  max: 0.3,
+  bands: ['A01', 'A16', 'A09']
+};
+
+Map.addLayer(image.clip(roi), embeddingVis, '2024–2025 embeddings');
+
+// =======================
+// Define reference points
+// =======================
+var centroid = roi.centroid({maxError: 10});  // 1 meter tolerance
+var coords = centroid.coordinates();
+var lon = ee.Number(coords.get(0));
+var lat = ee.Number(coords.get(1));
+var dLon = 0.125;
+var dLat = 0.09;
+
+//var refPoints = ee.FeatureCollection([
+//  ee.Feature(ee.Geometry.Point([lon, lat])),               // centroid
+//  ee.Feature(ee.Geometry.Point([lon.add(dLon), lat])),     // east
+//  ee.Feature(ee.Geometry.Point([lon, lat.add(dLat)]))      // north
+//]);
+
+var refPoints = ee.FeatureCollection([
+  ee.Feature(ee.Geometry.Point([4.313645554775594,51.160149077318245])),               
+  ee.Feature(ee.Geometry.Point([4.314037157291768,51.16036102595272])),     
+  ee.Feature(ee.Geometry.Point([4.313827944988606,51.160108706039374]))      
+]);
+
+
+Map.addLayer(refPoints, {color: 'yellow'}, 'Reference points');
+
+// =======================
+// Function: cosine similarity
+// =======================
+function similarityToPoint(pt) {
+  // Small buffer (~50 m) for 10 m resolution embeddings
+  var vecDict = image.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: pt.geometry().buffer(50),
+    scale: 10,
+    maxPixels: 1e9
+  });
+
+  // Build numeric array safely, replacing nulls with 0
+  var vecArray = ee.Array(
+    image.bandNames().map(function(b) {
+      var v = ee.Number(vecDict.get(b));
+      return ee.Algorithms.If(v, v, 0);
+    })
+  );
+
+  // Convert array → image (one band per embedding dimension)
+  var vecImg = ee.Image.constant(vecArray)
+    .arrayFlatten([image.bandNames()]);
+
+  // Dot product → similarity
+  return image.multiply(vecImg).reduce(ee.Reducer.sum());
+}
+
+// =======================
+// Compute similarity maps (3 refs)
+// =======================
+var sims = refPoints.toList(3).map(function(f) {
+  return similarityToPoint(ee.Feature(f));
+});
+
+var similarityMean = ee.ImageCollection.fromImages(sims).mean();
+
+// =======================
+// Z-score normalization
+// =======================
+var stats = similarityMean.reduceRegion({
+  reducer: ee.Reducer.mean().combine({
+    reducer2: ee.Reducer.stdDev(),
+    sharedInputs: true
+  }),
+  geometry: roi,
+  scale: 10,
+  maxPixels: 1e13,
+  tileScale: 4
+});
+
+var mean = ee.Number(ee.Algorithms.If(stats.get('sum_mean'), stats.get('sum_mean'), 0));
+var std = ee.Number(ee.Algorithms.If(stats.get('sum_stdDev'), stats.get('sum_stdDev'), 1));
+std = ee.Number(ee.Algorithms.If(std.eq(0), 1, std));
+
+var zScore = similarityMean.subtract(mean).divide(std);
+
+// =======================
+// Thresholding
+// =======================
+var threshold = 2;
+var highSimilarity = zScore.gt(threshold).selfMask();
+
+// =======================
+// Visualization
+// =======================
+Map.addLayer(
+  zScore.clip(roi),
+  {min: -2, max: 2, palette: ['blue', 'white', 'red']},
+  'Z-score cosine similarity'
+);
+
+Map.addLayer(
+  highSimilarity.clip(roi),
+  {palette: ['red']},
+  'High similarity areas'
+);
+
+Map.centerObject(roi, 8);
+Map.setOptions('SATELLITE');
